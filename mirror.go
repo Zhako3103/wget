@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha1"
 	"fmt"
 	"io"
 	"mime"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"time"
 )
 
 // MirrorOptions are the settings of --mirror and its companion flags.
@@ -21,12 +23,19 @@ type MirrorOptions struct {
 	Reject  []string // --reject / -R : file suffixes to skip
 	Exclude []string // --exclude / -X : directories to skip
 	Convert bool     // --convert-links
+	Level   int      // --level / -l : link depth (-1 = unlimited, 0 = only the start page + its files)
 }
 
 type page struct {
 	url  *url.URL
 	path string
 	kind string // "html" or "css"
+}
+
+type item struct {
+	u     *url.URL
+	depth int
+	nav   bool // reached through an <a> link (must stay on the site's host)
 }
 
 type mirror struct {
@@ -36,7 +45,7 @@ type mirror struct {
 	client  *http.Client
 	seen    map[string]bool   // URLs already queued/fetched
 	saved   map[string]string // URL key -> local file
-	queue   []*url.URL
+	queue   []item
 	pages   []page
 	reject  []string
 	exclude []string
@@ -72,8 +81,18 @@ func resolve(base *url.URL, ref string) (*url.URL, bool) {
 	return u, true
 }
 
+var extByType = map[string]string{
+	"image/jpeg": ".jpg", "image/png": ".png", "image/gif": ".gif", "image/webp": ".webp",
+	"image/svg+xml": ".svg", "image/x-icon": ".ico", "image/vnd.microsoft.icon": ".ico",
+	"image/avif": ".avif", "application/javascript": ".js", "text/javascript": ".js",
+	"application/json": ".json", "font/woff": ".woff", "font/woff2": ".woff2",
+	"application/font-woff": ".woff", "application/pdf": ".pdf",
+}
+
 // localPath decides where a downloaded URL is stored inside the mirror folder.
-func localPath(outDir string, u *url.URL, kind string) string {
+// Files of the main host go directly into outDir; files of other hosts (images
+// or styles served from a CDN) go into outDir/<host>/.
+func localPath(outDir string, root, u *url.URL, kind, mt string) string {
 	hasSlash := u.Path == "" || strings.HasSuffix(u.Path, "/")
 	p := path.Clean("/" + u.Path)
 	if hasSlash {
@@ -84,18 +103,31 @@ func localPath(outDir string, u *url.URL, kind string) string {
 		ext := path.Ext(base)
 		base = strings.TrimSuffix(base, ext) + "_" + unsafeNameRe.ReplaceAllString(u.RawQuery, "_") + ext
 	}
-	if kind == "html" {
-		if ext := strings.ToLower(path.Ext(base)); ext != ".html" && ext != ".htm" {
-			base += ".html"
+	ext := strings.ToLower(path.Ext(base))
+	switch {
+	case kind == "html" && ext != ".html" && ext != ".htm":
+		base += ".html"
+	case kind == "css" && ext != ".css":
+		base += ".css"
+	case kind == "" && ext == "":
+		base += extByType[mt]
+	}
+	if len(base) > 120 { // keep file names within file system limits
+		e := path.Ext(base)
+		if len(e) > 10 {
+			e = ""
 		}
+		sum := sha1.Sum([]byte(base))
+		base = fmt.Sprintf("%s_%x%s", base[:80], sum[:4], e)
+	}
+	if !strings.EqualFold(u.Host, root.Host) {
+		dir = path.Join("/", strings.ReplaceAll(strings.ToLower(u.Host), ":", "_"), dir) + "/"
 	}
 	return filepath.Join(outDir, filepath.FromSlash(dir), base)
 }
 
-func (m *mirror) allowed(u *url.URL) bool {
-	if (u.Scheme != "http" && u.Scheme != "https") || !strings.EqualFold(u.Host, m.root.Host) {
-		return false
-	}
+// passesFilters applies --reject and --exclude.
+func (m *mirror) passesFilters(u *url.URL) bool {
 	lp := strings.ToLower(u.Path)
 	for _, s := range m.reject {
 		if strings.HasSuffix(lp, "."+s) {
@@ -111,10 +143,26 @@ func (m *mirror) allowed(u *url.URL) bool {
 	return true
 }
 
-func (m *mirror) enqueue(base *url.URL, ref string) {
-	u, ok := resolve(base, ref)
-	if !ok || !m.allowed(u) {
+func (m *mirror) sameHost(u *url.URL) bool { return strings.EqualFold(u.Host, m.root.Host) }
+
+// enqueue schedules a reference found in a page at the given link depth.
+func (m *mirror) enqueue(base *url.URL, ref, kind string, depth int) {
+	if kind == kindOther {
 		return
+	}
+	u, ok := resolve(base, ref)
+	if !ok || !m.passesFilters(u) {
+		return
+	}
+	nav := kind == kindNav
+	if nav {
+		if !m.sameHost(u) {
+			return
+		}
+		depth++
+		if m.opt.Level >= 0 && depth > m.opt.Level {
+			return
+		}
 	}
 	k := urlKey(u)
 	if m.seen[k] {
@@ -122,7 +170,7 @@ func (m *mirror) enqueue(base *url.URL, ref string) {
 	}
 	m.seen[k] = true
 	u.Fragment = ""
-	m.queue = append(m.queue, u)
+	m.queue = append(m.queue, item{u, depth, nav})
 }
 
 func detectKind(mt string, u *url.URL) string {
@@ -142,13 +190,29 @@ func detectKind(mt string, u *url.URL) string {
 	return ""
 }
 
-func (m *mirror) fetch(u *url.URL) {
-	req, err := newRequest(u.String())
-	if err != nil {
-		fmt.Printf("skipped %s: %v\n", u, err)
-		return
+// get performs a request, retrying a few times when the server asks us to slow down.
+func (m *mirror) get(u *url.URL) (*http.Response, error) {
+	for attempt := 0; ; attempt++ {
+		req, err := newRequest(u.String())
+		if err != nil {
+			return nil, err
+		}
+		resp, err := m.client.Do(req)
+		if err != nil {
+			return nil, err
+		}
+		if (resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode == http.StatusServiceUnavailable) && attempt < 3 {
+			resp.Body.Close()
+			time.Sleep(time.Duration(attempt+1) * 2 * time.Second)
+			continue
+		}
+		return resp, nil
 	}
-	resp, err := m.client.Do(req)
+}
+
+func (m *mirror) fetch(it item) {
+	u := it.u
+	resp, err := m.get(u)
 	if err != nil {
 		fmt.Printf("failed  %s: %v\n", u, err)
 		return
@@ -162,8 +226,8 @@ func (m *mirror) fetch(u *url.URL) {
 	final := resp.Request.URL
 	key, fkey := urlKey(u), urlKey(final)
 	if fkey != key {
-		// redirected: stay on the same host and respect the filters
-		if !m.allowed(final) {
+		// redirected: respect the filters (and stay on the host for page links)
+		if !m.passesFilters(final) || (it.nav && !m.sameHost(final)) {
 			return
 		}
 		if p, ok := m.saved[fkey]; ok {
@@ -175,7 +239,7 @@ func (m *mirror) fetch(u *url.URL) {
 
 	mt, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type"))
 	kind := detectKind(mt, final)
-	local := localPath(m.outDir, final, kind)
+	local := localPath(m.outDir, m.root, final, kind, mt)
 	if err := os.MkdirAll(filepath.Dir(local), 0o755); err != nil {
 		fmt.Printf("failed  %s: %v\n", u, err)
 		return
@@ -208,10 +272,10 @@ func (m *mirror) fetch(u *url.URL) {
 	switch kind {
 	case "html":
 		m.pages = append(m.pages, page{final, local, kind})
-		processHTML(buf.String(), func(ref string) string { m.enqueue(final, ref); return ref })
+		processHTML(buf.String(), func(ref, k string) string { m.enqueue(final, ref, k, it.depth); return ref })
 	case "css":
 		m.pages = append(m.pages, page{final, local, kind})
-		processCSS(buf.String(), func(ref string) string { m.enqueue(final, ref); return ref })
+		processCSS(buf.String(), func(ref string) string { m.enqueue(final, ref, kindRes, it.depth); return ref })
 	}
 }
 
@@ -249,12 +313,11 @@ func (m *mirror) convertLinks() {
 		if err != nil {
 			continue
 		}
-		fn := func(ref string) string { return m.convertRef(pg, ref) }
 		var out string
 		if pg.kind == "html" {
-			out = processHTML(string(data), fn)
+			out = processHTML(string(data), func(ref, _ string) string { return m.convertRef(pg, ref) })
 		} else {
-			out = processCSS(string(data), fn)
+			out = processCSS(string(data), func(ref string) string { return m.convertRef(pg, ref) })
 		}
 		if out != string(data) {
 			if err := os.WriteFile(pg.path, []byte(out), 0o644); err == nil {
@@ -312,11 +375,11 @@ func runMirror(rawURL string, opt MirrorOptions) error {
 
 	root.Fragment = ""
 	m.seen[urlKey(root)] = true
-	m.queue = append(m.queue, root)
+	m.queue = append(m.queue, item{root, 0, true})
 	for len(m.queue) > 0 {
-		u := m.queue[0]
+		it := m.queue[0]
 		m.queue = m.queue[1:]
-		m.fetch(u)
+		m.fetch(it)
 	}
 	if m.files == 0 {
 		return fmt.Errorf("could not download anything from %s", rawURL)

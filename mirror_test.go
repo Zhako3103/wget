@@ -54,7 +54,7 @@ func TestMirror(t *testing.T) {
 	srv := testSite()
 	defer srv.Close()
 	dir := t.TempDir()
-	err := runMirror(srv.URL, MirrorOptions{Dir: dir, Reject: []string{"jpg"}, Exclude: []string{"/assets"}, Convert: true})
+	err := runMirror(srv.URL, MirrorOptions{Dir: dir, Reject: []string{"jpg"}, Exclude: []string{"/assets"}, Convert: true, Level: -1})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,5 +83,97 @@ func TestMirror(t *testing.T) {
 	about, _ := os.ReadFile(filepath.Join(root, "about.html"))
 	if !strings.Contains(string(about), `href="index.html"`) || !strings.Contains(string(about), `href="index.html#top"`) {
 		t.Errorf("about.html not converted: %s", about)
+	}
+}
+
+// Images/styles served from another host (like Wikipedia's upload.wikimedia.org)
+// must be downloaded, while <a> links to other hosts must not be followed.
+func TestMirrorCrossHostAssets(t *testing.T) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/style"):
+			w.Header().Set("Content-Type", "text/css")
+			w.Write([]byte(`body{background:url(/bg)}`))
+		case r.URL.Path == "/bg" || r.URL.Path == "/logo" || r.URL.Path == "/logo2x":
+			w.Header().Set("Content-Type", "image/png")
+			w.Write([]byte("png"))
+		case r.URL.Path == "/page":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("should not be followed"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer cdn.Close()
+	long := strings.Repeat("x", 300)
+	site := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<link rel="stylesheet" href="` + cdn.URL + `/style?a=` + long + `">
+<img src="` + cdn.URL + `/logo" srcset="` + cdn.URL + `/logo 1x, ` + cdn.URL + `/logo2x 2x">
+<a href="` + cdn.URL + `/page">other host</a> <a href="/two.html">two</a>`))
+		case "/two.html":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte(`<img src="` + cdn.URL + `/logo"><a href="/three.html">3</a>`))
+		case "/three.html":
+			w.Header().Set("Content-Type", "text/html")
+			w.Write([]byte("three"))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer site.Close()
+
+	count := func(root string) (n int, names []string) {
+		filepath.Walk(root, func(p string, i os.FileInfo, err error) error {
+			if err == nil && !i.IsDir() {
+				n++
+				names = append(names, strings.TrimPrefix(p, root))
+				if len(i.Name()) > 150 {
+					t.Errorf("file name too long: %d", len(i.Name()))
+				}
+			}
+			return nil
+		})
+		return
+	}
+
+	// level 0: only the page + its requisites
+	dir := t.TempDir()
+	if err := runMirror(site.URL, MirrorOptions{Dir: dir, Convert: true, Level: 0}); err != nil {
+		t.Fatal(err)
+	}
+	host := strings.ReplaceAll(strings.TrimPrefix(site.URL, "http://"), ":", "_")
+	cdnHost := strings.ReplaceAll(strings.TrimPrefix(cdn.URL, "http://"), ":", "_")
+	n, names := count(filepath.Join(dir, host))
+	if _, err := os.Stat(filepath.Join(dir, host, "two.html")); err == nil {
+		t.Error("two.html must not be downloaded with Level 0")
+	}
+	// index.html + stylesheet + bg + logo + logo2x = 5 files
+	if n != 5 {
+		t.Errorf("expected 5 files, got %d: %v", n, names)
+	}
+	idx, _ := os.ReadFile(filepath.Join(dir, host, "index.html"))
+	if !strings.Contains(string(idx), cdnHost+"/logo.png") || !strings.Contains(string(idx), cdnHost+"/logo2x.png 2x") {
+		t.Errorf("srcset/img not converted:\n%s", idx)
+	}
+	if !strings.Contains(string(idx), cdn.URL+"/page") {
+		t.Errorf("link to another host must stay absolute:\n%s", idx)
+	}
+	if !strings.Contains(string(idx), ".css") {
+		t.Errorf("style sheet should have a .css name:\n%s", idx)
+	}
+
+	// level 1: two.html is downloaded, three.html is not
+	dir = t.TempDir()
+	if err := runMirror(site.URL, MirrorOptions{Dir: dir, Level: 1}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(dir, host, "two.html")); err != nil {
+		t.Error("two.html should be downloaded with Level 1")
+	}
+	if _, err := os.Stat(filepath.Join(dir, host, "three.html")); err == nil {
+		t.Error("three.html must not be downloaded with Level 1")
 	}
 }

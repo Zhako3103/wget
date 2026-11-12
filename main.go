@@ -23,6 +23,8 @@ Options:
   -R, --reject=LIST  (mirror) comma separated file suffixes to skip, e.g. jpg,gif
   -X, --exclude=LIST (mirror) comma separated directories to skip, e.g. /js,/assets
   --convert-links    (mirror) convert links so the copy can be viewed offline
+  -l, --level=N      (mirror) follow links at most N levels deep (default: unlimited,
+                     0 = only the given page with its images, styles and scripts)
 `)
 }
 
@@ -33,6 +35,7 @@ func main() {
 		output, dir, rateStr, inputFile string
 		reject, exclude                 string
 		background, doMirror, convert   bool
+		level                           int
 	)
 	fs.StringVar(&output, "O", "", "")
 	fs.StringVar(&dir, "P", "", "")
@@ -41,6 +44,8 @@ func main() {
 	fs.BoolVar(&background, "B", false, "")
 	fs.BoolVar(&doMirror, "mirror", false, "")
 	fs.BoolVar(&convert, "convert-links", false, "")
+	fs.IntVar(&level, "level", -1, "")
+	fs.IntVar(&level, "l", -1, "")
 	fs.StringVar(&reject, "reject", "", "")
 	fs.StringVar(&reject, "R", "", "")
 	fs.StringVar(&exclude, "exclude", "", "")
@@ -85,7 +90,7 @@ func main() {
 	var runErr error
 	switch {
 	case doMirror:
-		mopt := MirrorOptions{Dir: dir, Rate: rate, Reject: splitList(reject), Exclude: splitList(exclude), Convert: convert}
+		mopt := MirrorOptions{Dir: dir, Rate: rate, Reject: splitList(reject), Exclude: splitList(exclude), Convert: convert, Level: level}
 		for _, u := range urls {
 			if err := runMirror(u, mopt); err != nil {
 				runErr = err
